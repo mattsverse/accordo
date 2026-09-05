@@ -1,0 +1,41 @@
+{
+  "name": "@matfire/accordo",
+  "version": "0.0.0",
+  "description": "Run development services together in terminal tabs or a merged log stream",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mattsverse/accordo.git"
+  },
+  "bugs": {"url": "https://github.com/mattsverse/accordo/issues"},
+  "homepage": "https://github.com/mattsverse/accordo",
+  "bin": {
+    "accordo": "bin/accordo.cjs"
+  },
+  "files": [
+    "bin/accordo.cjs",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "optionalDependencies": {
+    "@getaccordo/accordo-darwin-arm64": "0.0.0",
+    "@getaccordo/accordo-darwin-x64": "0.0.0",
+    "@getaccordo/accordo-linux-arm64-gnu": "0.0.0",
+    "@getaccordo/accordo-linux-x64-gnu": "0.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

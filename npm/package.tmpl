@@ -1,0 +1,12 @@
+{
+  name: $name,
+  version: $version,
+  description,
+  license,
+  repository,
+  homepage,
+  os: [$os],
+  cpu: [$arch],
+  files: ["bin/accordo", "LICENSE", "README.md"],
+  publishConfig: {access: "public"}
+} + (if $os == "linux" then {libc: ["glibc"]} else {} end)

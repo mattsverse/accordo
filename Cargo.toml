@@ -1,0 +1,45 @@
+[package]
+name = "accordo"
+version = "0.1.0"
+edition = "2024"
+description = "Run development services together in terminal tabs or a merged log stream"
+license = "MIT"
+repository = "https://github.com/mattsverse/accordo"
+homepage = "https://github.com/mattsverse/accordo"
+readme = "README.md"
+keywords = ["cli", "terminal", "development", "process", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
+
+[lib]
+name = "accordo"
+
+[[bin]]
+name = "accordo"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29.0"
+nix = { version = "0.30", features = ["signal", "process", "fs"] }
+portable-pty = "0.9"
+ratatui = "0.30.2"
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = "0.0.28"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "signal", "time", "net"] }
+tui-term = "0.3.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+[profile.dist]
+inherits = "release"
+
+[package.metadata.dist]
+formula = "accordo"

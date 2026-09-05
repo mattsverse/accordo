@@ -1,0 +1,360 @@
+name: Release
+
+on:
+  pull_request:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Serialize releases so concurrent tags cannot race to update the stable tap.
+concurrency:
+  group: release-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      artifacts: ${{ steps.plan.outputs.artifacts }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: rust github:axodotdev/cargo-dist
+      - name: Plan and validate the release
+        id: plan
+        run: |
+          version=$(cargo metadata --no-deps --format-version=1 | jq -er '.packages[] | select(.name == "accordo") | .version')
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+          dist plan --tag "v$version" --output-format=json > plan.json
+          jq -e --arg version "$version" '
+            (.releases | length) == 1 and
+            .releases[0].app_name == "accordo" and
+            .releases[0].app_version == $version
+          ' plan.json
+          matrix=$(jq -c '{include: [.ci.github.artifacts_matrix.include[] | .runner as $runner | .targets[] | {target: ., runner: $runner}]}' plan.json)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$(jq -r '.announcement_is_prerelease' plan.json)" >> "$GITHUB_OUTPUT"
+          echo "artifacts=$(jq -c '.releases[0].artifacts' plan.json)" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Require release commit on main
+        if: startsWith(github.ref, 'refs/tags/')
+        run: git merge-base --is-ancestor HEAD origin/main
+      - name: Require public release downloads
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" = false
+      - name: Verify publishable package
+        run: cargo publish --dry-run --locked
+
+  checks:
+    uses: ./.github/workflows/check.yml
+
+  npm-wrapper:
+    needs: plan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Test npm launcher
+        run: node --test npm/launcher.test.cjs
+      - name: Pack main npm package
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          mkdir -p target/npm/wrapper/bin target/npm/tarballs
+          jq --arg version "$VERSION" '
+            del(.private) | .version = $version |
+            .optionalDependencies |= with_entries(.value = $version)
+          ' npm/package.json > target/npm/wrapper/package.json
+          cp npm/bin/accordo.cjs target/npm/wrapper/bin/
+          cp LICENSE README.md target/npm/wrapper/
+          npm pack ./target/npm/wrapper --pack-destination target/npm/tarballs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-wrapper
+          path: target/npm/tarballs/*.tgz
+          if-no-files-found: error
+
+  build:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [plan, checks, npm-wrapper]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: rust github:axodotdev/cargo-dist
+      - name: Build release archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          dist build --tag "$RELEASE_TAG" --artifacts=local --target "$TARGET" --output-format=json > target-manifest.json
+          cp target-manifest.json "target/distrib/$TARGET-dist-manifest.json"
+      - name: Smoke test packaged binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir "$RUNNER_TEMP/accordo-smoke"
+          tar -xf "target/distrib/accordo-$TARGET.tar.xz" -C "$RUNNER_TEMP/accordo-smoke" --strip-components=1
+          "$RUNNER_TEMP/accordo-smoke/accordo" --version
+          "$RUNNER_TEMP/accordo-smoke/accordo" --help
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Pack platform npm package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          case "$TARGET" in
+            aarch64-apple-darwin) os=darwin; arch=arm64; suffix=darwin-arm64 ;;
+            x86_64-apple-darwin) os=darwin; arch=x64; suffix=darwin-x64 ;;
+            aarch64-unknown-linux-gnu) os=linux; arch=arm64; suffix=linux-arm64-gnu ;;
+            x86_64-unknown-linux-gnu) os=linux; arch=x64; suffix=linux-x64-gnu ;;
+            *) echo "Unsupported npm target: $TARGET" >&2; exit 1 ;;
+          esac
+          mkdir -p target/npm/platform/bin target/npm/tarballs
+          jq --arg name "@getaccordo/accordo-$suffix" --arg version "$VERSION" \
+             --arg os "$os" --arg arch "$arch" \
+             -f npm/package.tmpl npm/package.json > target/npm/platform/package.json
+          cp "$RUNNER_TEMP/accordo-smoke/accordo" target/npm/platform/bin/
+          chmod +x target/npm/platform/bin/accordo
+          cp LICENSE README.md target/npm/platform/
+          npm pack ./target/npm/platform --pack-destination target/npm/tarballs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-${{ matrix.target }}
+          path: target/npm/tarballs/*.tgz
+          if-no-files-found: error
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm-wrapper
+          path: target/npm/tarballs
+      - name: Test npm installation without lifecycle scripts or network
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm-smoke"
+          npm install --prefix "$RUNNER_TEMP/npm-smoke" --offline --ignore-scripts \
+            --no-audit --no-fund "$PWD"/target/npm/tarballs/*.tgz
+          test "$("$RUNNER_TEMP/npm-smoke/node_modules/.bin/accordo" --version)" = "accordo $VERSION"
+          ACCORDO_BINARY="$RUNNER_TEMP/npm-smoke/node_modules/.bin/accordo" python3 tests/terminal_smoke.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            target/distrib/*.tar.xz
+            target/distrib/*.sha256
+            target/distrib/*-dist-manifest.json
+          if-no-files-found: error
+
+  github-release:
+    needs: [plan, checks, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: rust github:axodotdev/cargo-dist
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: target/distrib
+          merge-multiple: true
+      - name: Build formula and checksums
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          PLANNED_ARTIFACTS: ${{ needs.plan.outputs.artifacts }}
+        run: |
+          dist build --tag "$RELEASE_TAG" --artifacts=global --output-format=json > dist-manifest.json
+          mkdir release-assets
+          # Copy every planned artifact; a missing platform or checksum fails the job.
+          jq -r '.[]' <<< "$PLANNED_ARTIFACTS" > artifact-names.txt
+          while IFS= read -r artifact; do
+            cp "target/distrib/$artifact" release-assets/
+          done < artifact-names.txt
+          cp dist-manifest.json release-assets/
+          jq -r '.announcement_github_body' dist-manifest.json > release-notes.md
+          ruby -c release-assets/accordo.rb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: homebrew-formula
+          path: release-assets/accordo.rb
+          if-no-files-found: error
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" |
+            jq -r --arg tag "$RELEASE_TAG" '.[] | select(.tag_name == $tag) | .draft')
+          case "$existing" in
+            false)
+              echo 'Release is already public. Re-run only failed jobs; published archives cannot be replaced.' >&2
+              exit 1 ;;
+            '')
+              gh release create "$RELEASE_TAG" --draft --verify-tag \
+                --title "Accordo $RELEASE_TAG" --notes-file release-notes.md ;;
+            true) ;; # Resume an interrupted draft upload.
+            *) exit 1 ;;
+          esac
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          latest=true
+          if [[ "$PRERELEASE" == true ]]; then latest=false; fi
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE" --latest="$latest"
+
+  crates-io:
+    needs: [plan, github-release]
+    if: needs.plan.outputs.prerelease == 'false'
+    uses: ./.github/workflows/publish-crate.yml
+    permissions:
+      contents: read
+      id-token: write
+
+  npm-publish:
+    needs: [plan, github-release]
+    if: needs.plan.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: npm-*
+          path: npm-tarballs
+          merge-multiple: true
+      - name: Publish binaries, then the main package using npm OIDC
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          publish() {
+            local archive="$1" name integrity status
+            name=$(tar -xOf "$archive" package/package.json | jq -er --arg version "$VERSION" \
+              'select(.version == $version) | .name')
+            integrity="sha512-$(openssl dgst -sha512 -binary "$archive" | openssl base64 -A)"
+            status=$(curl --silent --show-error --location --retry 3 \
+              --output "$RUNNER_TEMP/npm-version.json" --write-out '%{http_code}' \
+              "https://registry.npmjs.org/$name/$VERSION")
+            case "$status" in
+              200)
+                jq -e --arg integrity "$integrity" '.dist.integrity == $integrity' "$RUNNER_TEMP/npm-version.json"
+                echo "$name@$VERSION already published with identical contents" ;;
+              404) npm publish "./$archive" --access public --provenance --tag latest ;;
+              *) echo "npm registry returned HTTP $status for $name" >&2; exit 1 ;;
+            esac
+          }
+          binaries=(npm-tarballs/getaccordo-accordo-*.tgz)
+          test "${#binaries[@]}" -eq 4
+          for archive in "${binaries[@]}"; do publish "$archive"; done
+          publish "npm-tarballs/matfire-accordo-$VERSION.tgz"
+
+  npm-install-check:
+    needs: [plan, npm-publish]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Verify installation from npm
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          test "$(npm exec --yes --package="@matfire/accordo@$VERSION" -- accordo --version)" = "accordo $VERSION"
+
+  homebrew:
+    needs: [plan, github-release, crates-io]
+    if: needs.plan.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: mattsverse/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: homebrew-formula
+          path: Formula
+      - name: Update formula
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- Formula/accordo.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(accordo): release $RELEASE_TAG"
+            git push origin HEAD
+          fi
+
+  install-check:
+    needs: [plan, homebrew]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: false
+      - name: Verify mise installation
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mise use -g "github:mattsverse/accordo@${RELEASE_TAG#v}"
+          mise exec "github:mattsverse/accordo@${RELEASE_TAG#v}" -- accordo --version
+      - name: Verify Homebrew installation
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
+          brew install mattsverse/tap/accordo
+          test "$("$(brew --prefix mattsverse/tap/accordo)/bin/accordo" --version)" = "accordo ${RELEASE_TAG#v}"
