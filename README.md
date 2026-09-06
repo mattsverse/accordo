@@ -44,7 +44,13 @@ cargo install --path .
 
 For development, use `cargo run -- -f path/to/accordo.yaml`.
 
-Maintainers: see [the release procedure](docs/releasing.md) for publishing and recovery.
+## Releasing
+
+Set the repository secret `RELEASE_PLEASE_TOKEN` to a token with Contents,
+Issues, and Pull requests write access. Release Please tracks Conventional Commits
+on `main`, starting from `v0.1.0`. Merge its release PR to create a draft release
+and push the next tag, which triggers the existing publication workflow.
+The draft becomes public after the release assets are ready.
 
 ## Configure and run
 
